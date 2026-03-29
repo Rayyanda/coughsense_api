@@ -6,6 +6,7 @@ import io
 import uuid
 import sqlite3
 import math
+from typing import Optional
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL']  = '3'
@@ -14,14 +15,14 @@ warnings.filterwarnings('ignore', category=UserWarning, module='tensorflow')
 import numpy as np
 import tensorflow as tf
 import librosa
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 app = FastAPI(
     title="TBC Cough Detection API",
     description="API deteksi batuk TBC dengan autentikasi pengguna",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -36,6 +37,8 @@ MODEL_PATH  = "model/model.tflite"
 LABELS_PATH = "model/labels.txt"
 SAMPLE_RATE = 16000
 N_MFCC      = 40
+
+VALID_GENDERS = ["Laki-laki", "Perempuan", "Male", "Female"]
 
 # ─── Load model ────────────────────────────────────────────────────────────────
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
@@ -59,12 +62,14 @@ print(f"Target length: {TARGET_LENGTH}")
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 def get_conn():
-    return sqlite3.connect("tbc.db")
+    conn = sqlite3.connect("tbc.db")
+    conn.row_factory = sqlite3.Row   # akses kolom by name
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 def init_db():
     conn = get_conn()
 
-    # Tabel users
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id         TEXT PRIMARY KEY,
@@ -77,7 +82,6 @@ def init_db():
         )
     """)
 
-    # Tabel predictions — tambah kolom user_id
     conn.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id          TEXT PRIMARY KEY,
@@ -87,7 +91,7 @@ def init_db():
             confidence  REAL,
             all_scores  TEXT,
             mfcc_mean   TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     """)
 
@@ -109,18 +113,107 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
     usia:     int
-    gender:   str  # "Laki-laki" atau "Perempuan"
+    gender:   str
+
+    @field_validator("nama")
+    @classmethod
+    def nama_not_empty(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Nama tidak boleh kosong")
+        return v
+
+    @field_validator("username")
+    @classmethod
+    def username_valid(cls, v):
+        v = v.strip().lower()
+        if not v:
+            raise ValueError("Username tidak boleh kosong")
+        if len(v) < 3:
+            raise ValueError("Username minimal 3 karakter")
+        if not v.replace("_", "").replace(".", "").isalnum():
+            raise ValueError("Username hanya boleh huruf, angka, titik, atau underscore")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def password_valid(cls, v):
+        if len(v) < 6:
+            raise ValueError("Password minimal 6 karakter")
+        return v
+
+    @field_validator("usia")
+    @classmethod
+    def usia_valid(cls, v):
+        if v < 1 or v > 120:
+            raise ValueError("Usia tidak valid (1–120)")
+        return v
+
+    @field_validator("gender")
+    @classmethod
+    def gender_valid(cls, v):
+        if v not in VALID_GENDERS:
+            raise ValueError(f"Gender harus salah satu dari: {', '.join(VALID_GENDERS)}")
+        return v
+
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 
+class UpdateProfileRequest(BaseModel):
+    nama:         Optional[str] = None
+    usia:         Optional[int] = None
+    gender:       Optional[str] = None
+    old_password: Optional[str] = None   # wajib jika ganti password
+    new_password: Optional[str] = None
+
+    @field_validator("nama")
+    @classmethod
+    def nama_not_empty(cls, v):
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("Nama tidak boleh kosong")
+        return v
+
+    @field_validator("usia")
+    @classmethod
+    def usia_valid(cls, v):
+        if v is not None and (v < 1 or v > 120):
+            raise ValueError("Usia tidak valid (1–120)")
+        return v
+
+    @field_validator("gender")
+    @classmethod
+    def gender_valid(cls, v):
+        if v is not None and v not in VALID_GENDERS:
+            raise ValueError(f"Gender harus salah satu dari: {', '.join(VALID_GENDERS)}")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_valid(cls, v):
+        if v is not None and len(v) < 6:
+            raise ValueError("Password baru minimal 6 karakter")
+        return v
+
+
+# ─── Helper ────────────────────────────────────────────────────────────────────
 def sanitize_float(v: float) -> float:
-    """Ganti NaN/Inf dengan 0 agar JSON compliant."""
     if math.isnan(v) or math.isinf(v):
         return 0.0
     return v
+
+def user_row_to_dict(row) -> dict:
+    return {
+        "id":       row["id"],
+        "nama":     row["nama"],
+        "username": row["username"],
+        "usia":     row["usia"],
+        "gender":   row["gender"],
+    }
 
 # ─── MFCC Extraction ───────────────────────────────────────────────────────────
 def extract_mfcc(y: np.ndarray) -> dict:
@@ -153,6 +246,9 @@ def preprocess_audio(audio_bytes: bytes) -> tuple:
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Gagal membaca audio: {str(e)}")
 
+    if len(y) == 0:
+        raise HTTPException(status_code=422, detail="File audio kosong atau tidak valid")
+
     if len(y) < TARGET_LENGTH:
         y = np.pad(y, (0, TARGET_LENGTH - len(y)))
     else:
@@ -177,13 +273,13 @@ def preprocess_audio(audio_bytes: bytes) -> tuple:
 
     return features, mfcc_info
 
-# ─── Inference ────────────────────────────────────────────────────────────────
+# ─── Inference ─────────────────────────────────────────────────────────────────
 def run_inference(features: np.ndarray) -> dict:
     interpreter.set_tensor(input_details[0]["index"], features)
     interpreter.invoke()
     output = interpreter.get_tensor(output_details[0]["index"])[0]
 
-    scores = {labels[i]: sanitize_float(float(output[i])) for i in range(len(labels))}
+    scores          = {labels[i]: sanitize_float(float(output[i])) for i in range(len(labels))}
     predicted_label = labels[int(np.argmax(output))]
     confidence      = float(np.max(output))
 
@@ -193,7 +289,7 @@ def run_inference(features: np.ndarray) -> dict:
         "scores":     {k: round(v * 100, 2) for k, v in scores.items()},
     }
 
-# ─── Warmup ───────────────────────────────────────────────────────────────────
+# ─── Warmup ────────────────────────────────────────────────────────────────────
 def warmup_model():
     dummy = np.zeros((1, TARGET_LENGTH), dtype=np.float32)
     interpreter.set_tensor(input_details[0]["index"], dummy)
@@ -202,13 +298,14 @@ def warmup_model():
 
 warmup_model()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "TBC Cough Detection API v3 aktif"}
+    return {"status": "ok", "message": "TBC Cough Detection API v3.1 aktif"}
 
 @app.get("/health")
 def health():
@@ -216,17 +313,19 @@ def health():
         "status":  "healthy",
         "model":   MODEL_PATH,
         "labels":  labels,
-        "version": "3.0.0",
+        "version": "3.1.0",
     }
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
 
-@app.post("/register")
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/register", status_code=201)
 def register(data: RegisterRequest):
     """Daftar akun baru."""
     conn = get_conn()
 
-    # Cek username sudah ada
     existing = conn.execute(
         "SELECT id FROM users WHERE username = ?", (data.username,)
     ).fetchone()
@@ -235,23 +334,13 @@ def register(data: RegisterRequest):
         conn.close()
         raise HTTPException(status_code=400, detail="Username sudah digunakan")
 
-    # Validasi gender
-    if data.gender not in ["Laki-laki", "Perempuan"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Gender harus 'Laki-laki' atau 'Perempuan'")
-
-    # Validasi usia
-    if data.usia < 1 or data.usia > 120:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Usia tidak valid")
-
     user_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             user_id,
             data.nama.strip(),
-            data.username.strip().lower(),
+            data.username,
             hash_password(data.password),
             data.usia,
             data.gender,
@@ -265,12 +354,13 @@ def register(data: RegisterRequest):
         "message": "Registrasi berhasil",
         "user": {
             "id":       user_id,
-            "nama":     data.nama,
+            "nama":     data.nama.strip(),
             "username": data.username,
             "usia":     data.usia,
             "gender":   data.gender,
         },
     }
+
 
 @app.post("/login")
 def login(data: LoginRequest):
@@ -285,26 +375,118 @@ def login(data: LoginRequest):
     if not row:
         raise HTTPException(status_code=401, detail="Username tidak ditemukan")
 
-    if not verify_password(data.password, row[3]):
+    if not verify_password(data.password, row["password"]):
         raise HTTPException(status_code=401, detail="Password salah")
 
     return {
         "message": "Login berhasil",
         "user": {
-            "id":       row[0],
-            "nama":     row[1],
-            "username": row[2],
-            "usia":     row[4],
-            "gender":   row[5],
+            "id":       row["id"],
+            "nama":     row["nama"],
+            "username": row["username"],
+            "usia":     row["usia"],
+            "gender":   row["gender"],
         },
     }
 
-# ─── Predict ──────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROFILE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/profile/{user_id}")
+def get_profile(user_id: str):
+    """Ambil data profil pengguna."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, nama, username, usia, gender, created_at FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
+    return {
+        "id":         row["id"],
+        "nama":       row["nama"],
+        "username":   row["username"],
+        "usia":       row["usia"],
+        "gender":     row["gender"],
+        "created_at": row["created_at"],
+    }
+
+
+@app.put("/profile/{user_id}")
+def update_profile(user_id: str, data: UpdateProfileRequest):
+    """
+    Update profil pengguna.
+    - Kirim hanya field yang ingin diubah (partial update).
+    - Untuk ganti password, sertakan `old_password` dan `new_password`.
+    """
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, nama, username, password, usia, gender FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
+    # Ambil nilai saat ini, ganti hanya yang dikirim
+    new_nama   = data.nama   if data.nama   is not None else row["nama"]
+    new_usia   = data.usia   if data.usia   is not None else row["usia"]
+    new_gender = data.gender if data.gender is not None else row["gender"]
+    new_hash   = row["password"]  # default tetap
+
+    # Ganti password jika diminta
+    if data.new_password is not None:
+        if data.old_password is None:
+            conn.close()
+            raise HTTPException(
+                status_code=400,
+                detail="Masukkan password lama untuk mengganti password"
+            )
+        if not verify_password(data.old_password, row["password"]):
+            conn.close()
+            raise HTTPException(status_code=401, detail="Password lama salah")
+        new_hash = hash_password(data.new_password)
+
+    conn.execute(
+        "UPDATE users SET nama = ?, usia = ?, gender = ?, password = ? WHERE id = ?",
+        (new_nama, new_usia, new_gender, new_hash, user_id),
+    )
+    conn.commit()
+
+    # Ambil ulang data terbaru
+    updated = conn.execute(
+        "SELECT id, nama, username, usia, gender, created_at FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    return {
+        "message": "Profil berhasil diperbarui",
+        "user": {
+            "id":         updated["id"],
+            "nama":       updated["nama"],
+            "username":   updated["username"],
+            "usia":       updated["usia"],
+            "gender":     updated["gender"],
+            "created_at": updated["created_at"],
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICT
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    user_id: str = "",
+    user_id: str = Query(default=""),
 ):
     """
     Endpoint prediksi TBC.
@@ -314,21 +496,43 @@ async def predict(
     if not file.filename:
         raise HTTPException(status_code=400, detail="Tidak ada file yang dikirim")
 
+    # Validasi ekstensi
+    allowed_exts = {".wav", ".mp3", ".ogg", ".m4a", ".flac"}
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed_exts:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Format file tidak didukung. Gunakan: {', '.join(allowed_exts)}"
+        )
+
     contents = await file.read()
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="File kosong")
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File terlalu besar (maks 10 MB)")
 
     features, mfcc_info = preprocess_audio(contents)
     result = run_inference(features)
 
-    pred_id = str(uuid.uuid4())
-    conn    = get_conn()
+    pred_id   = str(uuid.uuid4())
+    timestamp = datetime.datetime.now().isoformat()
+
+    conn = get_conn()
+
+    # Validasi user_id jika disertakan
+    if user_id:
+        user_exists = conn.execute(
+            "SELECT id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if not user_exists:
+            user_id = ""   # abaikan user_id tidak valid, tetap simpan prediksi
+
     conn.execute(
         "INSERT INTO predictions VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             pred_id,
             user_id if user_id else None,
-            datetime.datetime.now().isoformat(),
+            timestamp,
             result["label"],
             result["confidence"],
             str(result["scores"]),
@@ -340,7 +544,7 @@ async def predict(
 
     return {
         "id":         pred_id,
-        "timestamp":  datetime.datetime.now().isoformat(),
+        "timestamp":  timestamp,
         "prediction": result["label"],
         "confidence": result["confidence"],
         "all_scores": result["scores"],
@@ -358,12 +562,27 @@ async def predict(
         },
     }
 
-# ─── History ──────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORY
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/history/{user_id}")
-def get_history(user_id: str, limit: int = 20):
-    """Ambil riwayat prediksi milik user tertentu."""
+def get_history(user_id: str, limit: int = Query(default=20, ge=1, le=100)):
+    """
+    Ambil riwayat prediksi milik user.
+    - **limit**: jumlah data (1–100, default 20)
+    """
     conn = get_conn()
+
+    # Pastikan user ada
+    user = conn.execute(
+        "SELECT id FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
     rows = conn.execute(
         """
         SELECT id, timestamp, label, confidence
@@ -377,46 +596,103 @@ def get_history(user_id: str, limit: int = 20):
     conn.close()
 
     return {
+        "total": len(rows),
         "data": [
             {
-                "id":         r[0],
-                "timestamp":  r[1],
-                "label":      r[2],
-                "confidence": r[3],
+                "id":         r["id"],
+                "timestamp":  r["timestamp"],
+                "label":      r["label"],
+                "confidence": r["confidence"],
             }
             for r in rows
-        ]
+        ],
     }
+
 
 @app.delete("/history/{pred_id}")
 def delete_prediction(pred_id: str):
-    """Hapus satu record prediksi."""
+    """Hapus satu record prediksi berdasarkan ID."""
     conn = get_conn()
+
+    existing = conn.execute(
+        "SELECT id FROM predictions WHERE id = ?", (pred_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Riwayat tidak ditemukan")
+
     conn.execute("DELETE FROM predictions WHERE id = ?", (pred_id,))
     conn.commit()
     conn.close()
-    return {"message": "Berhasil dihapus"}
 
-# ─── Profile ──────────────────────────────────────────────────────────────────
+    return {"message": "Riwayat berhasil dihapus", "id": pred_id}
 
-@app.get("/profile/{user_id}")
-def get_profile(user_id: str):
-    """Ambil data profil pengguna."""
+
+@app.delete("/history/all/{user_id}")
+def delete_all_history(user_id: str):
+    """Hapus semua riwayat prediksi milik user."""
     conn = get_conn()
+
+    user = conn.execute(
+        "SELECT id FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
+    result = conn.execute(
+        "DELETE FROM predictions WHERE user_id = ?", (user_id,)
+    )
+    deleted_count = result.rowcount
+    conn.commit()
+    conn.close()
+
+    return {
+        "message": f"{deleted_count} riwayat berhasil dihapus",
+        "deleted_count": deleted_count,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATS  (bonus — ringkasan statistik user)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/stats/{user_id}")
+def get_stats(user_id: str):
+    """
+    Ringkasan statistik pemeriksaan milik user:
+    total pemeriksaan, jumlah +TB, jumlah -TB, rata-rata confidence.
+    """
+    conn = get_conn()
+
+    user = conn.execute(
+        "SELECT id, nama FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
     row = conn.execute(
-        "SELECT id, nama, username, usia, gender, created_at FROM users WHERE id = ?",
+        """
+        SELECT
+            COUNT(*)                                          AS total,
+            SUM(CASE WHEN label LIKE '%+%' THEN 1 ELSE 0 END) AS tbc_positive,
+            SUM(CASE WHEN label NOT LIKE '%+%' THEN 1 ELSE 0 END) AS tbc_negative,
+            ROUND(AVG(confidence), 2)                         AS avg_confidence,
+            MAX(timestamp)                                    AS last_check
+        FROM predictions
+        WHERE user_id = ?
+        """,
         (user_id,),
     ).fetchone()
     conn.close()
 
-    if not row:
-        raise HTTPException(status_code=404, detail="User tidak ditemukan")
-
     return {
-        "id":         row[0],
-        "nama":       row[1],
-        "username":   row[2],
-        "usia":       row[3],
-        "gender":     row[4],
-        "created_at": row[5],
+        "user_id":        user_id,
+        "nama":           user["nama"],
+        "total":          row["total"] or 0,
+        "tbc_positive":   row["tbc_positive"] or 0,
+        "tbc_negative":   row["tbc_negative"] or 0,
+        "avg_confidence": row["avg_confidence"] or 0.0,
+        "last_check":     row["last_check"],
     }
