@@ -1,0 +1,3 @@
+0 +TB
+1 -TB
+2 Background Noise
