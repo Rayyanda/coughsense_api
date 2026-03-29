@@ -281,7 +281,7 @@ def run_inference(features: np.ndarray) -> dict:
 
     scores          = {labels[i]: sanitize_float(float(output[i])) for i in range(len(labels))}
     predicted_label = labels[int(np.argmax(output))]
-    confidence      = float(np.max(output))
+    confidence      = sanitize_float(float(np.max(output)))
 
     return {
         "label":      predicted_label,
