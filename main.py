@@ -5,6 +5,7 @@ import datetime
 import io
 import uuid
 import sqlite3
+import math
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL']  = '3'
@@ -114,6 +115,13 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+
+def sanitize_float(v: float) -> float:
+    """Ganti NaN/Inf dengan 0 agar JSON compliant."""
+    if math.isnan(v) or math.isinf(v):
+        return 0.0
+    return v
+
 # ─── MFCC Extraction ───────────────────────────────────────────────────────────
 def extract_mfcc(y: np.ndarray) -> dict:
     mfcc_matrix = librosa.feature.mfcc(
@@ -175,7 +183,7 @@ def run_inference(features: np.ndarray) -> dict:
     interpreter.invoke()
     output = interpreter.get_tensor(output_details[0]["index"])[0]
 
-    scores          = {labels[i]: float(output[i]) for i in range(len(labels))}
+    scores = {labels[i]: sanitize_float(float(output[i])) for i in range(len(labels))}
     predicted_label = labels[int(np.argmax(output))]
     confidence      = float(np.max(output))
 
@@ -339,10 +347,10 @@ async def predict(
         "is_tbc":     result["label"] == "+TB",
         "mfcc_features": {
             "n_mfcc":      N_MFCC,
-            "mfcc_mean":   [round(float(v), 4) for v in mfcc_info["mfcc_mean"]],
-            "mfcc_std":    [round(float(v), 4) for v in mfcc_info["mfcc_std"]],
-            "delta_mean":  [round(float(v), 4) for v in np.mean(mfcc_info["mfcc_delta"],  axis=1)],
-            "delta2_mean": [round(float(v), 4) for v in np.mean(mfcc_info["mfcc_delta2"], axis=1)],
+            "mfcc_mean":   [round(sanitize_float(float(v)), 4) for v in mfcc_info["mfcc_mean"]],
+            "mfcc_std":    [round(sanitize_float(float(v)), 4) for v in mfcc_info["mfcc_std"]],
+            "delta_mean":  [round(sanitize_float(float(v)), 4) for v in np.mean(mfcc_info["mfcc_delta"],  axis=1)],
+            "delta2_mean": [round(sanitize_float(float(v)), 4) for v in np.mean(mfcc_info["mfcc_delta2"], axis=1)],
             "description": (
                 f"Diekstraksi menggunakan metode MFCC dengan {N_MFCC} koefisien, "
                 f"window 25ms, hop 10ms, sample rate {SAMPLE_RATE}Hz."
