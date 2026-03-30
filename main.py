@@ -541,7 +541,9 @@ async def predict(
     )
     conn.commit()
     conn.close()
-
+    print(f"DEBUG result: {result}")
+    print(f"DEBUG confidence type: {type(result['confidence'])}, value: {result['confidence']}")
+    print(f"DEBUG scores: {result['scores']}")
     return {
         "id":         pred_id,
         "timestamp":  timestamp,
