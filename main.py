@@ -307,7 +307,7 @@ warmup_model()
 def root():
     return {"status": "ok", "message": "TBC Cough Detection API v3.1 aktif"}
 
-@app.get("/health", methods=["GET"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
         "status":  "healthy",
